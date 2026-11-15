@@ -86,3 +86,7 @@ spicetify backup apply        # или: spicetify restore backup apply
 | `volna.js` | расширение Spicetify (весь плеер) |
 | `volna-audio.py` | помощник: спектр системного звука для визуализатора |
 | `volna-audio.service` | systemd user unit для помощника |
+
+## Лицензия
+
+[MIT](LICENSE)
