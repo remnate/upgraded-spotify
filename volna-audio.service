@@ -1,0 +1,11 @@
+[Unit]
+Description=Volna: audio spectrum helper for the Spotify visualizer (localhost only)
+After=pipewire-pulse.service
+
+[Service]
+ExecStart=/usr/bin/python3 -I %h/myspotify/volna-audio.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

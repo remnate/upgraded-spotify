@@ -1,0 +1,6 @@
+# local backups of earlier versions
+volna.v*.bak.js
+# reference screenshots (third-party content)
+*.png
+*.jpg
+__pycache__/
