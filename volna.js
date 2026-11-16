@@ -365,6 +365,64 @@
     return lruSet(COLOR, uri, rgb, 300);
   }
 
+  // colours around the cover's edge, by angle from its centre (0 = right, clockwise), for the
+  // "bass" visualizer: each part of the ring takes the colour of the cover edge next to it
+  const EDGE_N = 36, EDGE = new Map();
+  function edgeColors(src) {
+    if (!src) return Promise.resolve(null);
+    const hit = lruGet(EDGE, src);
+    if (hit) return hit;
+    return lruSet(EDGE, src, new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        try {
+          const S2 = 32, c = document.createElement("canvas");
+          c.width = c.height = S2;
+          const ctx = c.getContext("2d");
+          ctx.drawImage(img, 0, 0, S2, S2);
+          const d = ctx.getImageData(0, 0, S2, S2).data;
+          let out = new Float32Array(EDGE_N * 3);
+          for (let k = 0; k < EDGE_N; k++) {
+            const a = (k / EDGE_N) * Math.PI * 2, dx = Math.cos(a), dy = Math.sin(a);
+            const t = 1 / Math.max(Math.abs(dx), Math.abs(dy));
+            let r = 0, g = 0, b = 0, n = 0;
+            // a small patch just inside the edge at this angle
+            for (let depth = 1; depth <= 4; depth++) {
+              const px = 15.5 + dx * t * (15.5 - depth), py = 15.5 + dy * t * (15.5 - depth);
+              for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+                const x = clamp(Math.round(px + ox), 0, S2 - 1), y = clamp(Math.round(py + oy), 0, S2 - 1);
+                const o = (y * S2 + x) * 4;
+                r += d[o]; g += d[o + 1]; b += d[o + 2]; n++;
+              }
+            }
+            r /= n; g /= n; b /= n;
+            // keep the hue, lift it so it glows on the dark background
+            const mx = Math.max(r, g, b, 1), mn = Math.min(r, g, b);
+            const k2 = 235 / mx;
+            r *= k2; g *= k2; b *= k2;
+            const sat = (mx - mn) / mx, boost = sat > 0.12 ? 1.25 : 1, avg = (r + g + b) / 3;
+            out[k * 3] = clamp(avg + (r - avg) * boost, 0, 255);
+            out[k * 3 + 1] = clamp(avg + (g - avg) * boost, 0, 255);
+            out[k * 3 + 2] = clamp(avg + (b - avg) * boost, 0, 255);
+          }
+          // soften jumps between neighbouring angles
+          for (let pass = 0; pass < 2; pass++) {
+            const tmp = new Float32Array(out.length);
+            for (let k = 0; k < EDGE_N; k++) for (let ch = 0; ch < 3; ch++) {
+              const p = (k + EDGE_N - 1) % EDGE_N, q = (k + 1) % EDGE_N;
+              tmp[k * 3 + ch] = (out[p * 3 + ch] + 2 * out[k * 3 + ch] + out[q * 3 + ch]) / 4;
+            }
+            out = tmp;
+          }
+          resolve(out);
+        } catch (e) { resolve(null); }
+      };
+      img.onerror = () => resolve(null);
+      img.src = src;
+    }), 30);
+  }
+
   // ================= icons =================
   const STROKE = 'viewBox="0 0 24 24" style="fill:none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
   const I = {
@@ -404,6 +462,7 @@
     transition:opacity .35s ease;font-family:var(--encore-body-font-stack,"SpotifyMixUI",system-ui,sans-serif);
     --c:40,40,48;background:rgb(var(--c));user-select:none}
   ${R}.open{opacity:1;pointer-events:auto}
+  ${R}:not(.open) *{animation-play-state:paused !important}
   ${R} button{all:unset;box-sizing:border-box;cursor:pointer}
   ${R}.idle{cursor:none}
   ${R}.idle .v-top,${R}.idle .v-chip{opacity:0}
@@ -767,6 +826,7 @@
       settleTimer = setTimeout(() => {
         if (cur !== i) return;
         getColor(i.uri, i.image).then((rgb) => { if (cur === i) setColor(rgb); });
+        edgeColors(i.image).then((e) => { if (cur === i) viz.edgeTarget = e; });
         analysis(i.uri).then((a) => { if (cur === i) { audio = a; computeTiming(); } });
         loadLyrics(i);
         schedulePrefetch();
@@ -1183,7 +1243,8 @@
   const VIZ_URL = "http://127.0.0.1:47823/stream";
   const viz = { es: null, lastMsg: 0, retryAt: 0, raw: new Float32Array(65), bands: new Float32Array(64), bass: 0,
     bassAvg: 0.3, bassMax: 0.5, agc: 0.5, segIdx: 0, accent: "255,255,255", rgb: [120, 120, 130], parts: [], lastT: 0,
-    trail: [new Float32Array(64), new Float32Array(64), new Float32Array(64)] };
+    trail: [new Float32Array(64), new Float32Array(64), new Float32Array(64)],
+    edge: null, edgeTarget: null };
   const vizReal = () => !!viz.es && performance.now() - viz.lastMsg < 600;
   function vizSetColor(rgb) { viz.rgb = rgb; viz.accent = rgb.map((v) => Math.round(v + (255 - v) * 0.45)).join(","); }
   function vizConnect() {
@@ -1334,17 +1395,37 @@
       const decays = [0.03, 0.017, 0.009];
       viz.trail.forEach((tr, L) => { for (let b = 0; b < 64; b++) tr[b] = Math.max(viz.bands[b], tr[b] - decays[L] * dt); });
       const W3 = [255, 255, 255];
+      // colours from the cover's edges glide to the new track's instead of jumping
+      const tgt = viz.edgeTarget;
+      if (tgt) {
+        if (!viz.edge) viz.edge = Float32Array.from(tgt);
+        else { const k = Math.min(1, 0.06 * dt); for (let j = 0; j < tgt.length; j++) viz.edge[j] += (tgt[j] - viz.edge[j]) * k; }
+      }
+      const E = viz.edge && ctx.createConicGradient ? viz.edge : null;
+      const cx = ox + size / 2, cy = oy + size / 2;
+      const edgeAt = (x, y) => {
+        const f = ((Math.atan2(y - cy, x - cx) / (Math.PI * 2)) + 1) % 1, k = Math.round(f * EDGE_N) % EDGE_N;
+        return [E[k * 3], E[k * 3 + 1], E[k * 3 + 2]];
+      };
+      const ringFill = (whiten, a) => {
+        const g = ctx.createConicGradient(0, cx, cy);
+        for (let k = 0; k <= EDGE_N; k++) {
+          const j = (k % EDGE_N) * 3;
+          g.addColorStop(k / EDGE_N, `rgba(${mix([E[j], E[j + 1], E[j + 2]], W3, whiten)},${a})`);
+        }
+        return g;
+      };
       const layers = [
-        { src: viz.trail[2], base: 0.03, amp: 0.58, col: mix(viz.rgb, W3, 0.1), a: 0.55, glow: true },
-        { src: viz.trail[1], base: 0.024, amp: 0.44, col: mix(viz.rgb, W3, 0.35), a: 0.75 },
-        { src: viz.trail[0], base: 0.016, amp: 0.3, col: mix(viz.rgb, W3, 0.65), a: 0.9 },
-        { src: viz.bands, base: 0.004, amp: 0.1, col: "255,255,255", a: 0.95 },
+        { src: viz.trail[2], base: 0.03, amp: 0.58, col: mix(viz.rgb, W3, 0.1), w: 0, a: 0.55, glow: true },
+        { src: viz.trail[1], base: 0.024, amp: 0.44, col: mix(viz.rgb, W3, 0.35), w: 0.2, a: 0.75 },
+        { src: viz.trail[0], base: 0.016, amp: 0.3, col: mix(viz.rgb, W3, 0.65), w: 0.45, a: 0.9 },
+        { src: viz.bands, base: 0.004, amp: 0.1, col: "255,255,255", w: 0.75, a: 0.95 },
       ];
       for (const L of layers) {
         const pts = ringPoints(per, sampleRing(L.src, 96, 0), size * L.base, size * L.amp * small * (0.7 + 0.6 * B), 1.1);
         ctx.save();
         if (L.glow) { ctx.shadowBlur = size * 0.08; ctx.shadowColor = `rgba(${A},.9)`; }
-        ctx.fillStyle = `rgba(${L.col},${L.a})`;
+        ctx.fillStyle = E ? ringFill(L.w, L.a) : `rgba(${L.col},${L.a})`;
         smoothPath(ctx, pts);
         ctx.fill();
         ctx.restore();
@@ -1354,14 +1435,15 @@
       for (let e = 0; e < emit && viz.parts.length < 260; e++) {
         const sp = Math.random(), [x, y, nx, ny] = per.at(sp * per.total), sp0 = size * (0.002 + 0.006 * B + Math.random() * 0.003);
         const j = (Math.random() - 0.5) * 0.8;
-        viz.parts.push({ x: x + nx * size * 0.05, y: y + ny * size * 0.05, vx: (nx - ny * j) * sp0, vy: (ny + nx * j) * sp0, life: 1, decay: 0.005 + Math.random() * 0.008, r: 0.7 + Math.random() * 1.8 });
+        viz.parts.push({ x: x + nx * size * 0.05, y: y + ny * size * 0.05, vx: (nx - ny * j) * sp0, vy: (ny + nx * j) * sp0, life: 1, decay: 0.005 + Math.random() * 0.008, r: 0.7 + Math.random() * 1.8,
+          col: E ? mix(edgeAt(x, y), W3, 0.5) : "255,255,255" });
       }
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
       viz.parts = viz.parts.filter((p) => {
         p.x += p.vx * dt; p.y += p.vy * dt; p.life -= p.decay * dt;
         if (p.life <= 0) return false;
-        ctx.fillStyle = `rgba(255,255,255,${(p.life * 0.85).toFixed(3)})`;
+        ctx.fillStyle = `rgba(${p.col},${(p.life * 0.85).toFixed(3)})`;
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
         ctx.fill();
